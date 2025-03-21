@@ -5,6 +5,7 @@ import os
 import random
 import time
 import torch
+# from peft import LoraConfig, get_peft_model, TaskType
 
 from progress.bar import Bar
 from torch.utils.data import DataLoader, ConcatDataset
@@ -20,8 +21,8 @@ def evaluate_loss(model, dataloader, config):
     loss_avg = AverageMeter()
     dataiter = iter(dataloader)
     
-    model.eval()
-    with torch.no_grad():
+    model.eval()  # Set model to evaluation mode
+    with torch.no_grad():  # No gradient computation during evaluation
         for i in range(len(dataloader)):
             try:
                 joints, masks, padding_mask = next(dataiter)
@@ -31,6 +32,7 @@ def evaluate_loss(model, dataloader, config):
             in_joints, in_masks, out_joints, out_masks, padding_mask = batch_process_coords(joints, masks, padding_mask, config)
             padding_mask = padding_mask.to(config["DEVICE"])
 
+            # Compute loss using the model predictions
             loss, _ = compute_loss(model, config, in_joints, out_joints, in_masks, out_masks, padding_mask)
             loss_avg.update(loss.item(), len(in_joints))
             
@@ -76,13 +78,30 @@ def adjust_learning_rate(optimizer, epoch, config):
         
 def save_checkpoint(model, optimizer, epoch, config, filename, logger):
     logger.info(f'Saving checkpoint to {filename}.')
-    ckpt = {
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'epoch': epoch,
-        'config': config
-    }
-    torch.save(ckpt, os.path.join(config['OUTPUT']['ckpt_dir'], filename))
+    os.makedirs(config['OUTPUT']['ckpt_dir'], exist_ok=True)
+    checkpoint_path = os.path.join(config['OUTPUT']['ckpt_dir'], filename)
+    
+    if config.get("LORA", {}).get("enabled", False):
+        lora_save_path = os.path.join(config['OUTPUT']['ckpt_dir'], f"lora_{epoch}")
+        os.makedirs(lora_save_path, exist_ok=True)
+        model.save_pretrained(lora_save_path)
+        logger.info(f"Saved LoRA weights to {lora_save_path}")
+        
+        ckpt = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'epoch': epoch,
+            'config': config
+        }
+        torch.save(ckpt, checkpoint_path)
+    else:
+        ckpt = {
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'epoch': epoch,
+            'config': config
+        }
+        torch.save(ckpt, checkpoint_path)
 
     
 def dataloader_for(dataset, config, **kwargs):
@@ -100,13 +119,7 @@ def dataloader_for_val(dataset, config, **kwargs):
                       **kwargs)
 
 def train(config, logger, experiment_name="", dataset_name=""):
-
-    ################################
-    # Load data
-    ################################
-
-    in_F = 5  # Number of input frames
-    out_F = 5  # Number of predicted frames
+    in_F, out_F = 9, 12  # Original input and output frame lengths
     config['TRAIN']['input_track_size'] = in_F
     config['TRAIN']['output_track_size'] = out_F
 
@@ -116,7 +129,6 @@ def train(config, logger, experiment_name="", dataset_name=""):
 
     dataset_val = create_dataset(config['DATA']['train_datasets'][0], logger, split="val", track_size=(in_F+out_F), track_cutoff=in_F)
     dataloader_val = dataloader_for(dataset_val, config, shuffle=True, pin_memory=True)
-
 
     writer_name = experiment_name + "_" + str(datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
     writer_train = SummaryWriter(os.path.join(config["OUTPUT"]["runs_dir"], f"{writer_name}_TRAIN"))
@@ -128,7 +140,7 @@ def train(config, logger, experiment_name="", dataset_name=""):
 
     model = create_model(config, logger)
 
-    if config["MODEL"]["checkpoint"] != "":
+    if config["MODEL"].get("checkpoint", ""):
         logger.info(f"Loading checkpoint from {config['MODEL']['checkpoint']}")
         checkpoint = torch.load(os.path.join(config['OUTPUT']['ckpt_dir'], config["MODEL"]["checkpoint"]))
         model.load_state_dict(checkpoint["model"])
@@ -186,7 +198,7 @@ def train(config, logger, experiment_name="", dataset_name=""):
             # Forward Pass 
             ################################
             start = time.time()
-            loss, pred_joints = compute_loss(model, config, in_joints, out_joints, in_masks, out_masks, padding_mask, epoch=epoch, mode='train', optimizer=None)
+            pred_joints, aux_joints = model(in_joints, padding_mask, metamask=True)
             
             timer["FORWARD"] = time.time() - start
 
@@ -194,7 +206,10 @@ def train(config, logger, experiment_name="", dataset_name=""):
             # Backward Pass + Optimization
             ################################
             start = time.time()
-            loss.backward()
+            primary_loss = MSE_LOSS(pred_joints[:, in_F:], out_joints, out_masks)
+            auxiliary_loss = MSE_LOSS(aux_joints[:, :in_F], in_joints, in_masks)
+            total_loss = primary_loss + config['TRAIN']['aux_weight'] * auxiliary_loss
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), config["TRAIN"]["max_grad_norm"])
             optimizer.step()
                 
@@ -204,7 +219,7 @@ def train(config, logger, experiment_name="", dataset_name=""):
             # Logging 
             ################################
 
-            loss_avg.update(loss.item(), len(joints))
+            loss_avg.update(total_loss.item(), len(joints))
             
             summary = [
                 f"{str(epoch).zfill(3)} ({i + 1}/{train_steps})",

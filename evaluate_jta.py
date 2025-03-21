@@ -10,7 +10,7 @@ from dataset_jta import batch_process_coords, create_dataset, collate_batch
 from model_jta import create_model
 from utils.utils import create_logger
 
-def inference(model, config, input_joints, padding_mask, out_len=5):
+def inference(model, config, input_joints, padding_mask, out_len=12):
     model.eval()
     
     with torch.no_grad():
@@ -23,6 +23,8 @@ def inference(model, config, input_joints, padding_mask, out_len=5):
 
 def evaluate_ade_fde(model, modality_selection, dataloader, bs, config, logger, return_all=False):
     in_F, out_F = config['TRAIN']['input_track_size'], config['TRAIN']['output_track_size']
+    assert in_F == 9
+    assert out_F == 12
     bar = Bar(f"EVAL ADE_FDE", fill="#", max=len(dataloader))
 
     ade_batch = 0 
@@ -135,10 +137,10 @@ if __name__ == "__main__":
     # Load data
     ################################
 
-    # Set 5-frame input + 5-frame prediction
-    config['TRAIN']['input_track_size'] = 5
-    config['TRAIN']['output_track_size'] = 5
-    in_F, out_F = 5, 5
+    # Set 9-frame input + 12-frame prediction
+    config['TRAIN']['input_track_size'] = 9
+    config['TRAIN']['output_track_size'] = 12
+    in_F, out_F = 9, 12
 
     name = config['DATA']['train_datasets']
     

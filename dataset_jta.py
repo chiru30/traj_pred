@@ -24,7 +24,7 @@ def batch_process_coords(coords, masks, padding_mask, config, modality_selection
     masks = masks.to(config["DEVICE"])
     
     # Set the new frame sizes
-    in_F, out_F = 5, 5  # Observing 5 frames, predicting next 5 frames
+    in_F, out_F = 9, 12  # Observing 9 frames, predicting next 12 frames
     config["TRAIN"]["input_track_size"] = in_F
     config["TRAIN"]["output_track_size"] = out_F
 
@@ -70,11 +70,7 @@ def batch_process_coords(coords, masks, padding_mask, config, modality_selection
 
 
 class MultiPersonTrajPoseDataset(torch.utils.data.Dataset):
-    def __init__(self, name, split="train", track_size=10, track_cutoff=5, segmented=True,
-                 add_flips=False, frequency=1):
-        """
-        Updated: `track_size=10` and `track_cutoff=5` for observing 5 frames and predicting 5 frames.
-        """
+    def __init__(self, name, split="train", track_size=21, track_cutoff=9, segmented=True, add_flips=False, frequency=1):
         self.name = name
         self.split = split
         self.track_size = track_size
@@ -89,7 +85,7 @@ class MultiPersonTrajPoseDataset(torch.utils.data.Dataset):
         self.load_data()
         tracks = []
         for scene in self.datalist:
-            for seg, j in enumerate(range(0, len(scene[0][0]) - 10 + 1, 5)):  # 5 input frames, 5 output frames
+            for seg, j in enumerate(range(0, len(scene[0][0]) - 21 + 1, 9)):  # 9 input frames, 12 output frames 
                 people = []
                 for person in scene:
                     start_idx = j
@@ -135,10 +131,7 @@ def create_dataset(dataset_name, logger, **args):
 
 
 def get_datasets(datasets_list, config, logger):
-    """
-    Updated `track_size` and `track_cutoff` to (5+5)
-    """
-    in_F, out_F = 5, 5  # Set fixed values for input and output frames
+    in_F, out_F = 9, 12  # Original input and output frame lengths
     config["TRAIN"]["input_track_size"] = in_F
     config["TRAIN"]["output_track_size"] = out_F
 

@@ -6,6 +6,8 @@ import numpy as np
 import argparse
 from datetime import datetime
 
+#from peft import LoraConfig, get_peft_model, TaskType, PeftModel, PeftConfig
+
 class AuxilliaryEncoderCMT(nn.TransformerEncoder):
     def __init__(self, encoder_layer_local, num_layers, norm=None):
         super(AuxilliaryEncoderCMT, self).__init__(encoder_layer=encoder_layer_local,
@@ -124,7 +126,7 @@ class Learnedpose2dEncoding(nn.Module):
 
 
 class TransMotion(nn.Module):
-    def __init__(self, tok_dim=10, nhid=256, nhead=4, dim_feedfwd=1024, nlayers_local=2, nlayers_global=4, dropout=0.1, activation='relu', output_scale=1, obs_and_pred=10, num_tokens=47, device='cuda:0'):
+    def __init__(self, tok_dim=21, nhid=256, nhead=4, dim_feedfwd=1024, nlayers_local=2, nlayers_global=4, dropout=0.1, activation='relu', output_scale=1, obs_and_pred=21, num_tokens=47, device='cuda:0'):
         super(TransMotion, self).__init__()
         
         self.seq_len = tok_dim
@@ -132,27 +134,27 @@ class TransMotion(nn.Module):
         self.output_scale = output_scale
         self.token_num = num_tokens
         self.joints_pose = 22
-        self.obs_and_pred = obs_and_pred  # 10 (5 input + 5 predicted)
+        self.obs_and_pred = obs_and_pred  # 21 (9 input + 12 predicted)
         self.device = device
         
         self.fc_in_traj = nn.Linear(2, nhid)
         self.fc_out_traj = nn.Linear(nhid, 2)
-        self.double_id_encoder = LearnedTrajandIDEncoding(nhid, dropout, seq_len=10, device=device)
-        self.id_encoder = LearnedIDEncoding(nhid, dropout, seq_len=10, device=device)
+        self.double_id_encoder = LearnedTrajandIDEncoding(nhid, dropout, seq_len=21, device=device)
+        self.id_encoder = LearnedIDEncoding(nhid, dropout, seq_len=21, device=device)
 
         self.scale = torch.sqrt(torch.FloatTensor([nhid])).to(device)
 
         self.fc_in_3dbb = nn.Linear(4, nhid)
-        self.bb3d_encoder = Learnedbb3dEncoding(nhid, dropout, device=device)
+        self.bb3d_encoder = Learnedbb3dEncoding(nhid, dropout, seq_len=9, device=device)
 
         self.fc_in_2dbb = nn.Linear(4, nhid)
-        self.bb2d_encoder = Learnedbb2dEncoding(nhid, dropout, device=device)
+        self.bb2d_encoder = Learnedbb2dEncoding(nhid, dropout, seq_len=9, device=device)
 
         self.fc_in_3dpose = nn.Linear(3, nhid)
-        self.pose3d_encoder = Learnedpose3dEncoding(nhid, dropout, device=device)
+        self.pose3d_encoder = Learnedpose3dEncoding(nhid, dropout, seq_len=198, device=device)
 
         self.fc_in_2dpose = nn.Linear(2, nhid)
-        self.pose2d_encoder = Learnedpose2dEncoding(nhid, dropout, device=device)
+        self.pose2d_encoder = Learnedpose2dEncoding(nhid, dropout, seq_len=198, device=device)
 
         encoder_layer_local = nn.TransformerEncoderLayer(d_model=nhid,
                                                          nhead=nhead,
@@ -167,6 +169,9 @@ class TransMotion(nn.Module):
                                                           dropout=dropout,
                                                           activation=activation)
         self.global_former = AuxilliaryEncoderST(encoder_layer_global, num_layers=nlayers_global)
+
+        # Auxiliary decoder
+        self.aux_fc_out_traj = nn.Linear(nhid, 2)  # Adjust output channels for 9-frame reconstruction
 
     def forward(self, tgt, padding_mask, metamask=None):
         B, in_F, NJ, K = tgt.shape  # Batch size, input frames, tokens, features
@@ -239,16 +244,13 @@ class TransMotion(nn.Module):
         out_global = self.global_former(out_local, mask=None, src_key_padding_mask=padding_mask)
         out_global = out_global * self.output_scale + out_local
 
-        out_primary = out_global.reshape(N, F, out_global.size(1), self.nhid)[0]
-        out_primary = self.fc_out_traj(out_primary)
+        out_primary = self.fc_out_traj(out_global)
+        out_auxiliary = self.aux_fc_out_traj(out_global)
 
-        return out_primary.transpose(0, 1).reshape(B, F, 1, 2)
+        return out_primary, out_auxiliary
 
 
 def create_model(config, logger):
-    """
-    Creates and returns the TransMotion model with fine-tuning settings.
-    """
     seq_len = config["MODEL"]["seq_len"]  # 10 (5 input + 5 prediction)
     token_num = config["MODEL"]["token_num"]
     nhid = config["MODEL"]["dim_hidden"]
@@ -256,20 +258,16 @@ def create_model(config, logger):
     nlayers_local = config["MODEL"]["num_layers_local"]
     nlayers_global = config["MODEL"]["num_layers_global"]
     dim_feedforward = config["MODEL"]["dim_feedforward"]
-    
-    # Fetch device configuration
     device = config["DEVICE"]
 
-    # Ensure we use the 5+5 frame setup
     obs_and_pred = config["TRAIN"]["input_track_size"] + config["TRAIN"]["output_track_size"]
     assert obs_and_pred == (config["TRAIN"]["input_track_size"] + config["TRAIN"]["output_track_size"]), \
     f"ERROR: Expected {config['TRAIN']['input_track_size'] + config['TRAIN']['output_track_size']} frames, got {obs_and_pred}."
 
-
     if config["MODEL"]["type"] == "transmotion":
         logger.info("Creating TransMotion model with 5-frame input and 5-frame prediction.")
         
-        model = TransMotion(
+        base_model = TransMotion(
             tok_dim=seq_len,
             nhid=nhid,
             nhead=nhead,
@@ -277,10 +275,30 @@ def create_model(config, logger):
             nlayers_local=nlayers_local,
             nlayers_global=nlayers_global,
             output_scale=config["MODEL"]["output_scale"],
-            obs_and_pred=obs_and_pred,  # 10 frames (5+5)
+            obs_and_pred=obs_and_pred,
             num_tokens=token_num,
             device=device
         ).to(device).float()
+        
+        if config.get("LORA", {}).get("enabled", False):
+            lora_config = LoraConfig(
+                r=config["LORA"]["rank"],
+                lora_alpha=config["LORA"]["alpha"],
+                target_modules=config["LORA"]["target_modules"],
+                lora_dropout=config["LORA"]["dropout"],
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,
+            )
+            
+            model = get_peft_model(base_model, lora_config)
+            trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            all_params = sum(p.numel() for p in model.parameters())
+            
+            logger.info(f"Applied LoRA fine-tuning with rank {config['LORA']['rank']}")
+            logger.info(f"Trainable parameters: {trainable_params:,} ({trainable_params/all_params:.2%} of total)")
+        else:
+            model = base_model
+            logger.info("Using full fine-tuning (LoRA disabled)")
         
     else:
         raise ValueError(f"ERROR: Model type '{config['MODEL']['type']}' not supported.")
